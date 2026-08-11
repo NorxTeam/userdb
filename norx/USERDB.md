@@ -3,10 +3,12 @@
 ## Ownership and paths
 
 The mutable database is owned by the userdb service and stored at
-`/cfg/userdb/users.db`. A writer must write `/cfg/userdb/users.db.tmp` with
-bounded contents, close it, and rename it over the old file. Readers open the
-committed path only. The current VFS `rename` operation is the atomic commit
-point; a future durable-storage ABI must add an explicit flush guarantee.
+`/cfg/userdb/users.db`. A writer must use `atomic_replace`: acquire the
+single-writer lock, write bounded contents to
+`/cfg/userdb/users.db.tmp`, sync the temporary file, rename it over the old
+file, sync the containing directory, and release the lock. Readers open the
+committed path only. A storage backend that cannot provide these operations
+must return `Unavailable` rather than silently claiming durability.
 
 On load, a valid committed file wins. If it is missing or malformed, a valid
 temporary file is promoted and reported as `RecoveredTemp`; if both copies are
@@ -59,9 +61,21 @@ performed only by an injected password-verifier implementation.
   appears merely because the UID is zero.
 - Account/group mutation requires `account-admin`, except a user changing its
   own password after the caller has authenticated it. Authorization is checked
-  before any temporary file is written.
-- Lockout state is bounded and is committed with the account update. A crashed
-  update leaves the previous committed database intact.
+  before hashing or any temporary file is written. Disabled and locked users
+  cannot change their own password; an expired user may still change it so the
+  account can recover.
+- `Database::change_password` requires a matching confirmation and a bounded
+  policy (`8..=128` bytes by default), rejects NUL/CR/LF, verifies the old
+  password for non-administrators, rejects password reuse, and validates the
+  hasher's resulting PHC string before mutating memory. `None` for the old
+  password is accepted only for `account-admin` reset.
+- `Database::set_locked` is a separate privileged operation. `Lockout` is a
+  bounded in-memory decision state; callers must serialize it together with
+  the account update through `atomic_replace` if lockout persistence is
+  required.
+- `AtomicStorage` makes writer locking and file/directory sync explicit. A
+  failed write, sync, or rename never publishes a partial database; recovery
+  promotes a valid temporary file only while holding the writer lock.
 
 The exported ABI is the Rust API in `norx/src/lib.rs`; C-facing login and
 administration wrappers are intentionally deferred until the stable Norx

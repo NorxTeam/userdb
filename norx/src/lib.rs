@@ -4,6 +4,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 
 pub const FORMAT_HEADER: &[u8] = b"NORX-USERDB 1";
 pub const MAX_DATABASE_BYTES: usize = 64 * 1024;
@@ -13,6 +14,7 @@ pub const MAX_GROUPS: usize = 128;
 pub const MAX_NAME_BYTES: usize = 31;
 pub const MAX_PATH_BYTES: usize = 255;
 pub const MAX_HASH_BYTES: usize = 256;
+pub const MAX_PASSWORD_BYTES: usize = 128;
 pub const FLAG_DISABLED: u32 = 1 << 0;
 pub const FLAG_LOCKED: u32 = 1 << 1;
 pub const FLAG_EXPIRED: u32 = 1 << 2;
@@ -113,10 +115,20 @@ pub struct GroupEntry {
     pub members: Vec<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct Account {
     entry: UserEntry,
     password_hash: String,
+}
+
+impl fmt::Debug for Account {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Account")
+            .field("entry", &self.entry)
+            .field("password_hash", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -127,6 +139,60 @@ pub struct Database {
 
 pub trait PasswordVerifier {
     fn verify(&self, password: &[u8], encoded_hash: &[u8]) -> bool;
+}
+
+pub trait PasswordHasher {
+    fn hash(&self, password: &[u8]) -> Option<String>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PasswordPolicy {
+    pub min_length: usize,
+    pub max_length: usize,
+}
+
+impl PasswordPolicy {
+    pub const DEFAULT: Self = Self {
+        min_length: 8,
+        max_length: MAX_PASSWORD_BYTES,
+    };
+
+    fn validate(self, password: &[u8], confirmation: &[u8]) -> Result<(), PasswordChangeError> {
+        if self.min_length == 0
+            || self.min_length > self.max_length
+            || self.max_length > MAX_PASSWORD_BYTES
+        {
+            return Err(PasswordChangeError::InvalidPolicy);
+        }
+        if password.len() > self.max_length || confirmation.len() > self.max_length {
+            return Err(PasswordChangeError::InvalidPassword);
+        }
+        if !constant_time_equal(password, confirmation) {
+            return Err(PasswordChangeError::ConfirmationMismatch);
+        }
+        if password.len() < self.min_length
+            || password.len() > self.max_length
+            || password
+                .iter()
+                .any(|byte| *byte == 0 || *byte == b'\r' || *byte == b'\n')
+        {
+            return Err(PasswordChangeError::InvalidPassword);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordChangeError {
+    NotFound,
+    Denied,
+    OldPasswordRejected,
+    ConfirmationMismatch,
+    PasswordReuse,
+    InvalidPassword,
+    InvalidPolicy,
+    HashFailed,
+    InvalidHash,
 }
 
 impl Database {
@@ -216,6 +282,68 @@ impl Database {
         Err(AuthError::Denied)
     }
 
+    pub fn change_password<V: PasswordVerifier, H: PasswordHasher>(
+        &mut self,
+        actor: SessionCredentials,
+        target_uid: u32,
+        old_password: Option<&[u8]>,
+        new_password: &[u8],
+        confirmation: &[u8],
+        policy: PasswordPolicy,
+        verifier: &V,
+        hasher: &H,
+    ) -> Result<(), PasswordChangeError> {
+        self.authorize_mutation(actor, target_uid, Mutation::ChangeOwnPassword)
+            .map_err(|_| PasswordChangeError::Denied)?;
+        let index = self
+            .accounts
+            .iter()
+            .position(|account| account.entry.uid == target_uid)
+            .ok_or(PasswordChangeError::NotFound)?;
+        let administrator = actor.has_capability(CAP_ACCOUNT_ADMIN);
+        if !administrator {
+            if self.accounts[index].entry.flags & (FLAG_DISABLED | FLAG_LOCKED) != 0 {
+                return Err(PasswordChangeError::Denied);
+            }
+            let Some(old_password) = old_password else {
+                return Err(PasswordChangeError::OldPasswordRejected);
+            };
+            if !verifier.verify(old_password, self.accounts[index].password_hash.as_bytes()) {
+                return Err(PasswordChangeError::OldPasswordRejected);
+            }
+        }
+        policy.validate(new_password, confirmation)?;
+        if verifier.verify(new_password, self.accounts[index].password_hash.as_bytes()) {
+            return Err(PasswordChangeError::PasswordReuse);
+        }
+        let encoded = hasher
+            .hash(new_password)
+            .ok_or(PasswordChangeError::HashFailed)?;
+        validate_password_hash(encoded.as_bytes()).map_err(|_| PasswordChangeError::InvalidHash)?;
+        self.accounts[index].password_hash = encoded;
+        Ok(())
+    }
+
+    pub fn set_locked(
+        &mut self,
+        actor: SessionCredentials,
+        target_uid: u32,
+        locked: bool,
+    ) -> Result<(), AuthError> {
+        self.authorize_mutation(actor, target_uid, Mutation::ModifyAccount)?;
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|account| account.entry.uid == target_uid)
+            .ok_or(AuthError::Denied)?;
+        if locked {
+            account.entry.flags |= FLAG_LOCKED;
+        } else {
+            account.entry.flags &= !FLAG_LOCKED;
+        }
+        Ok(())
+    }
+
     pub fn serialize_for_storage(&self) -> Result<Vec<u8>, SerializeError> {
         let mut output = Vec::new();
         output.extend_from_slice(FORMAT_HEADER);
@@ -302,6 +430,7 @@ impl Database {
 pub enum StorageError {
     Missing,
     Unavailable,
+    Busy,
     Corrupt,
     TooLarge,
 }
@@ -314,8 +443,12 @@ pub enum RecoveryState {
 
 pub trait AtomicStorage {
     fn read(&mut self, path: &[u8], output: &mut Vec<u8>) -> Result<(), StorageError>;
+    fn lock(&mut self) -> Result<(), StorageError>;
     fn write_temp(&mut self, path: &[u8], contents: &[u8]) -> Result<(), StorageError>;
+    fn sync_file(&mut self, path: &[u8]) -> Result<(), StorageError>;
     fn replace(&mut self, temp_path: &[u8], committed_path: &[u8]) -> Result<(), StorageError>;
+    fn sync_parent(&mut self, committed_path: &[u8]) -> Result<(), StorageError>;
+    fn unlock(&mut self) -> Result<(), StorageError>;
 }
 
 pub fn atomic_replace<S: AtomicStorage>(
@@ -327,8 +460,18 @@ pub fn atomic_replace<S: AtomicStorage>(
     let contents = database
         .serialize_for_storage()
         .map_err(|_| StorageError::TooLarge)?;
-    storage.write_temp(temp_path, &contents)?;
-    storage.replace(temp_path, committed_path)
+    storage.lock()?;
+    let result = (|| {
+        storage.write_temp(temp_path, &contents)?;
+        storage.sync_file(temp_path)?;
+        storage.replace(temp_path, committed_path)?;
+        storage.sync_parent(committed_path)
+    })();
+    let unlock = storage.unlock();
+    match (result, unlock) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
 }
 
 pub fn load_with_recovery<S: AtomicStorage>(
@@ -354,15 +497,26 @@ fn recover_temp<S: AtomicStorage>(
     committed_path: &[u8],
     temp_path: &[u8],
 ) -> Result<(Database, RecoveryState), StorageError> {
+    storage.lock()?;
     let mut temporary = Vec::new();
-    match storage.read(temp_path, &mut temporary) {
-        Ok(()) => {}
-        Err(StorageError::Missing | StorageError::Corrupt) => return Err(StorageError::Corrupt),
-        Err(error) => return Err(error),
+    let result = (|| {
+        match storage.read(temp_path, &mut temporary) {
+            Ok(()) => {}
+            Err(StorageError::Missing | StorageError::Corrupt) => {
+                return Err(StorageError::Corrupt)
+            }
+            Err(error) => return Err(error),
+        }
+        let database = Database::parse(&temporary).map_err(|_| StorageError::Corrupt)?;
+        storage.replace(temp_path, committed_path)?;
+        storage.sync_parent(committed_path)?;
+        Ok((database, RecoveryState::RecoveredTemp))
+    })();
+    let unlock = storage.unlock();
+    match (result, unlock) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
     }
-    let database = Database::parse(&temporary).map_err(|_| StorageError::Corrupt)?;
-    storage.replace(temp_path, committed_path)?;
-    Ok((database, RecoveryState::RecoveredTemp))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -540,6 +694,15 @@ fn validate_password_hash(value: &[u8]) -> Result<(), ParseError> {
     Ok(())
 }
 
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(left.get(index).copied().unwrap_or(0))
+            ^ usize::from(right.get(index).copied().unwrap_or(0));
+    }
+    difference == 0
+}
+
 const fn is_base64(byte: u8) -> bool {
     matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=')
 }
@@ -592,9 +755,27 @@ mod tests {
         }
     }
 
+    struct Hasher;
+
+    impl PasswordHasher for Hasher {
+        fn hash(&self, password: &[u8]) -> Option<String> {
+            (password == b"newpass!").then(|| {
+                String::from(
+                    "$argon2id$v=19$m=65536,t=3,p=1$bmV3c2FsdFNhbXBsZQ$bmV3ZGlnaWVzdFNhbXBsZQ",
+                )
+            })
+        }
+    }
+
+    const NEW_HASH: &[u8] =
+        b"$argon2id$v=19$m=65536,t=3,p=1$bmV3c2FsdFNhbXBsZQ$bmV3ZGlnaWVzdFNhbXBsZQ";
+
     #[test]
     fn parses_without_exposing_hash_and_authenticates() {
         let database = Database::parse(DATABASE).unwrap();
+        let debug = alloc::format!("{database:?}");
+        assert!(!debug.contains(core::str::from_utf8(HASH).unwrap()));
+        assert!(debug.contains("<redacted>"));
         let user = database.lookup_user(b"alice").unwrap();
         assert_eq!(user.uid, 1000);
         assert!(user.is_enabled());
@@ -650,6 +831,116 @@ mod tests {
     }
 
     #[test]
+    fn password_change_requires_old_password_and_confirmation() {
+        let mut database = Database::parse(DATABASE).unwrap();
+        let actor = SessionCredentials::from_user(&database.lookup_user(b"alice").unwrap());
+        assert_eq!(
+            database.change_password(
+                actor,
+                1000,
+                Some(b"correct"),
+                b"correct",
+                b"correct",
+                PasswordPolicy {
+                    min_length: 7,
+                    max_length: MAX_PASSWORD_BYTES,
+                },
+                &Verifier,
+                &Hasher,
+            ),
+            Err(PasswordChangeError::PasswordReuse)
+        );
+        assert_eq!(
+            database.change_password(
+                actor,
+                1000,
+                Some(b"wrong"),
+                b"newpass!",
+                b"newpass!",
+                PasswordPolicy::DEFAULT,
+                &Verifier,
+                &Hasher,
+            ),
+            Err(PasswordChangeError::OldPasswordRejected)
+        );
+        assert_eq!(
+            database.change_password(
+                actor,
+                1000,
+                Some(b"correct"),
+                b"newpass!",
+                b"different",
+                PasswordPolicy::DEFAULT,
+                &Verifier,
+                &Hasher,
+            ),
+            Err(PasswordChangeError::ConfirmationMismatch)
+        );
+        database
+            .change_password(
+                actor,
+                1000,
+                Some(b"correct"),
+                b"newpass!",
+                b"newpass!",
+                PasswordPolicy::DEFAULT,
+                &Verifier,
+                &Hasher,
+            )
+            .unwrap();
+        let serialized = database.serialize_for_storage().unwrap();
+        assert!(serialized
+            .windows(NEW_HASH.len())
+            .any(|window| window == NEW_HASH));
+        assert!(!serialized
+            .windows(b"newpass!".len())
+            .any(|window| window == b"newpass!"));
+    }
+
+    #[test]
+    fn administrator_can_reset_and_lock_but_users_cannot() {
+        let database = Database::parse(DATABASE).unwrap();
+        let root = SessionCredentials {
+            real_uid: 0,
+            effective_uid: 0,
+            saved_uid: 0,
+            real_gid: 0,
+            effective_gid: 0,
+            saved_gid: 0,
+            capabilities: CAP_ACCOUNT_ADMIN,
+        };
+        let mut database = database;
+        database
+            .change_password(
+                root,
+                1000,
+                None,
+                b"newpass!",
+                b"newpass!",
+                PasswordPolicy::DEFAULT,
+                &Verifier,
+                &Hasher,
+            )
+            .unwrap();
+        assert!(database.set_locked(root, 1000, true).is_ok());
+        assert_eq!(database.lookup_user(b"alice").unwrap().flags, FLAG_LOCKED);
+        assert!(database.set_locked(root, 1000, false).is_ok());
+        let alice = SessionCredentials {
+            real_uid: 1000,
+            effective_uid: 1000,
+            saved_uid: 1000,
+            real_gid: 1000,
+            effective_gid: 1000,
+            saved_gid: 1000,
+            capabilities: 0,
+        };
+        assert_eq!(
+            database.set_locked(alice, 1000, true),
+            Err(AuthError::Denied)
+        );
+    }
+
+    #[test]
     fn lockout_is_bounded_and_resets_on_success() {
         let mut lockout = Lockout::new();
         lockout.register_failure(10, 3, 100);
@@ -667,6 +958,7 @@ mod tests {
         committed: Option<Vec<u8>>,
         temporary: Option<Vec<u8>>,
         unavailable: bool,
+        locked: bool,
     }
 
     impl AtomicStorage for MemoryStorage {
@@ -684,12 +976,31 @@ mod tests {
             Ok(())
         }
 
+        fn lock(&mut self) -> Result<(), StorageError> {
+            if self.unavailable {
+                return Err(StorageError::Unavailable);
+            }
+            if self.locked {
+                return Err(StorageError::Busy);
+            }
+            self.locked = true;
+            Ok(())
+        }
+
         fn write_temp(&mut self, _path: &[u8], contents: &[u8]) -> Result<(), StorageError> {
             if self.unavailable {
                 return Err(StorageError::Unavailable);
             }
             self.temporary = Some(contents.to_vec());
             Ok(())
+        }
+
+        fn sync_file(&mut self, _path: &[u8]) -> Result<(), StorageError> {
+            if self.unavailable {
+                Err(StorageError::Unavailable)
+            } else {
+                Ok(())
+            }
         }
 
         fn replace(
@@ -701,6 +1012,19 @@ mod tests {
                 return Err(StorageError::Unavailable);
             }
             self.committed = self.temporary.take();
+            Ok(())
+        }
+
+        fn sync_parent(&mut self, _committed_path: &[u8]) -> Result<(), StorageError> {
+            if self.unavailable {
+                Err(StorageError::Unavailable)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unlock(&mut self) -> Result<(), StorageError> {
+            self.locked = false;
             Ok(())
         }
     }
@@ -733,6 +1057,21 @@ mod tests {
             load_with_recovery(&mut storage, b"db", b"tmp"),
             Err(StorageError::Unavailable)
         );
+    }
+
+    #[test]
+    fn atomic_storage_rejects_concurrent_writer_and_does_not_publish_partial_data() {
+        let database = Database::parse(DATABASE).unwrap();
+        let mut storage = MemoryStorage::default();
+        storage.lock().unwrap();
+        assert_eq!(
+            atomic_replace(&mut storage, b"db", b"tmp", &database),
+            Err(StorageError::Busy)
+        );
+        assert!(storage.committed.is_none());
+        storage.unlock().unwrap();
+        atomic_replace(&mut storage, b"db", b"tmp", &database).unwrap();
+        assert!(storage.committed.is_some());
     }
 
     #[test]
