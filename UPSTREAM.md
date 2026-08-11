@@ -4,7 +4,8 @@
 - Maintained upstream fork: `https://github.com/shadow-maint/shadow`
 - Local remotes: `origin` is the Norx fork; `upstream` is the maintained
   source repository.
-- Fork baseline: `e4bd855` (`man: Document UAPI merging in login.defs`)
+- Fork baseline: `e4bd855661afe7c83ad2745d086a538398205225`
+  (`man: Document UAPI merging in login.defs`)
 - License: preserve the upstream shadow license and notices; new Norx adapter
   code is GPL-3.0-or-later.
 
