@@ -1,0 +1,25 @@
+[package]
+name = "norx-userdb"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+userspace = { path = "../../userspace/rust" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "userdb-smoke"
+path = "src/bin/userdb-smoke.rs"
+test = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

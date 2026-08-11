@@ -1,0 +1,26 @@
+schema = "gamma-recipe"
+version = 2
+
+[package]
+name = "userdb"
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+
+[source]
+kind = "git-fork"
+fork = "https://github.com/NorxTeam/userdb.git"
+upstream = "https://github.com/shadow-maint/shadow.git"
+baseline = "e4bd855"
+norx_scope = "norx/"
+
+[build]
+script = "norx/scripts/build.py"
+targets = ["x86_64-unknown-norx", "aarch64-unknown-norx"]
+dependencies = ["userspace"]
+
+[outputs]
+files = [
+  "tests/userdb/x86_64-unknown-norx/userdb-smoke.elf",
+  "tests/userdb/aarch64-unknown-norx/userdb-smoke.elf",
+  "var/lib/userdb/manifest.toml",
+]
