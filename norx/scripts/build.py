@@ -111,7 +111,7 @@ def main() -> int:
         'abi_version = 1',
         f'upstream_commit = "{git_output("rev-parse", "upstream/master")}"',
         f'fork_commit = "{git_output("rev-parse", "HEAD")}"',
-        f'dirty = {bool(git_output("status", "--porcelain"))}',
+        f'dirty = {str(bool(git_output("status", "--porcelain"))).lower()}',
         'record_format = "NORX-USERDB 1"',
         'password_policy = "argon2id m=65536,t=3,p=1"',
         'storage_path = "/cfg/userdb/users.db"',
