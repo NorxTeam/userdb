@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import argparse
 import os
 from pathlib import Path
 import sys
@@ -31,7 +32,20 @@ def git_output(*arguments: str) -> str:
     return checked_output(["git", "-C", str(USERDB_ROOT), *arguments]).strip()
 
 
+def upstream_commit(branch: str | None) -> tuple[str, str]:
+    name = branch or "master"
+    ref = f"upstream/{name}"
+    return name, git_output("rev-parse", "--verify", ref)
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--branch",
+        help="optional upstream branch to record; defaults to the upstream default branch",
+    )
+    args = parser.parse_args()
+    source_branch, source_commit = upstream_commit(args.branch)
     versions = load_toml(REPO_ROOT / "toolchain" / "versions.toml")
     abi = load_toml(REPO_ROOT / "toolchain" / "abi.toml")
     cargo = cargo_command(versions["rust_toolchain"])
@@ -109,7 +123,8 @@ def main() -> int:
         'schema = "userdb-build"',
         "version = 1",
         'abi_version = 1',
-        f'upstream_commit = "{git_output("rev-parse", "upstream/master")}"',
+        f'upstream_branch = "{source_branch}"',
+        f'upstream_commit = "{source_commit}"',
         f'fork_commit = "{git_output("rev-parse", "HEAD")}"',
         f'dirty = {str(bool(git_output("status", "--porcelain"))).lower()}',
         'record_format = "NORX-USERDB 1"',

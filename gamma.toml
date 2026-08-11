@@ -7,11 +7,13 @@ version = "0.1.0"
 license = "GPL-3.0-or-later"
 
 [source]
-kind = "git-fork"
-fork = "https://github.com/NorxTeam/userdb.git"
-upstream = "https://github.com/shadow-maint/shadow.git"
+kind = "git"
+url = "https://github.com/shadow-maint/shadow.git"
 baseline = "e4bd855661afe7c83ad2745d086a538398205225"
 norx_scope = "norx/"
+
+[provenance]
+maintained_fork = "https://github.com/NorxTeam/userdb.git"
 
 [build]
 script = "norx/scripts/build.py"
