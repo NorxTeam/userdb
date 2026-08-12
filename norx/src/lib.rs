@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -23,6 +24,8 @@ pub const CAP_ACCOUNT_ADMIN: u64 = 1 << 8;
 pub const CAP_SESSION_ADMIN: u64 = 1 << 9;
 pub const KNOWN_CAPABILITIES: u64 = CAP_ACCOUNT_ADMIN | CAP_SESSION_ADMIN;
 pub const ARGON2ID_PREFIX: &[u8] = b"$argon2id$v=19$m=65536,t=3,p=1$";
+pub const LOCKED_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=65536,t=3,p=1$bG9ja2VkLXNlbnRpbmVs$bm90LWEtcGFzc3dvcmQ=";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
@@ -115,7 +118,7 @@ pub struct GroupEntry {
     pub members: Vec<String>,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Account {
     entry: UserEntry,
     password_hash: String,
@@ -131,7 +134,7 @@ impl fmt::Debug for Account {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Database {
     accounts: Vec<Account>,
     groups: Vec<GroupEntry>,
@@ -193,6 +196,50 @@ pub enum PasswordChangeError {
     InvalidPolicy,
     HashFailed,
     InvalidHash,
+}
+
+pub const FIRST_DYNAMIC_ID: u32 = 1000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminError {
+    PermissionDenied,
+    InvalidInput,
+    InvalidId,
+    InvalidHash,
+    Duplicate,
+    NotFound,
+    Limit,
+    Storage(StorageError),
+    Serialization,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserSpec {
+    pub name: String,
+    pub uid: Option<u32>,
+    pub primary_gid: Option<u32>,
+    pub supplementary_groups: Vec<String>,
+    pub home: Option<String>,
+    pub shell: Option<String>,
+    pub flags: u32,
+    pub capabilities: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserUpdate {
+    pub name: Option<String>,
+    pub primary_gid: Option<u32>,
+    pub supplementary_groups: Option<Vec<String>>,
+    pub home: Option<String>,
+    pub shell: Option<String>,
+    pub flags: Option<u32>,
+    pub capabilities: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupUpdate {
+    pub name: Option<String>,
+    pub members: Option<Vec<String>>,
 }
 
 impl Database {
@@ -342,6 +389,360 @@ impl Database {
             account.entry.flags &= !FLAG_LOCKED;
         }
         Ok(())
+    }
+
+    pub fn list_users(&self) -> Vec<UserEntry> {
+        self.accounts
+            .iter()
+            .map(|account| account.entry.clone())
+            .collect()
+    }
+
+    pub fn list_groups(&self) -> Vec<GroupEntry> {
+        self.groups.clone()
+    }
+
+    pub fn create_group(
+        &mut self,
+        actor: SessionCredentials,
+        name: String,
+        gid: Option<u32>,
+        members: Vec<String>,
+    ) -> Result<u32, AdminError> {
+        require_admin(actor)?;
+        validate_name_string(&name)?;
+        if self.groups.iter().any(|group| group.name == name) {
+            return Err(AdminError::Duplicate);
+        }
+        validate_group_members(self, &members)?;
+        let gid = match gid {
+            Some(gid) => gid,
+            None => next_id(self.groups.iter().map(|group| group.gid)).ok_or(AdminError::Limit)?,
+        };
+        if self.groups.iter().any(|group| group.gid == gid) {
+            return Err(AdminError::Duplicate);
+        }
+        if self.groups.len() == MAX_GROUPS {
+            return Err(AdminError::Limit);
+        }
+        self.groups.push(GroupEntry { name, gid, members });
+        Ok(gid)
+    }
+
+    pub fn modify_group(
+        &mut self,
+        actor: SessionCredentials,
+        gid: u32,
+        update: GroupUpdate,
+    ) -> Result<(), AdminError> {
+        require_admin(actor)?;
+        let index = self
+            .groups
+            .iter()
+            .position(|group| group.gid == gid)
+            .ok_or(AdminError::NotFound)?;
+        let name = update.name.as_ref().unwrap_or(&self.groups[index].name);
+        validate_name_string(name)?;
+        if self
+            .groups
+            .iter()
+            .enumerate()
+            .any(|(other, group)| other != index && group.name == *name)
+        {
+            return Err(AdminError::Duplicate);
+        }
+        let members = update
+            .members
+            .as_ref()
+            .unwrap_or(&self.groups[index].members);
+        validate_group_members(self, members)?;
+        let name = name.clone();
+        let members = members.clone();
+        self.groups[index].name = name.clone();
+        self.groups[index].members = members.clone();
+        Ok(())
+    }
+
+    pub fn delete_group(&mut self, actor: SessionCredentials, gid: u32) -> Result<(), AdminError> {
+        require_admin(actor)?;
+        if self.accounts.iter().any(|account| account.entry.gid == gid) {
+            return Err(AdminError::PermissionDenied);
+        }
+        let index = self
+            .groups
+            .iter()
+            .position(|group| group.gid == gid)
+            .ok_or(AdminError::NotFound)?;
+        if !self.groups[index].members.is_empty() {
+            return Err(AdminError::PermissionDenied);
+        }
+        self.groups.remove(index);
+        Ok(())
+    }
+
+    pub fn create_user<H: PasswordHasher>(
+        &mut self,
+        actor: SessionCredentials,
+        spec: UserSpec,
+        password: &[u8],
+        hasher: &H,
+    ) -> Result<u32, AdminError> {
+        require_admin(actor)?;
+        if self.accounts.len() == MAX_USERS {
+            return Err(AdminError::Limit);
+        }
+        validate_user_fields(
+            &spec.name,
+            spec.flags,
+            spec.capabilities,
+            spec.home.as_deref(),
+            spec.shell.as_deref(),
+        )?;
+        if self
+            .accounts
+            .iter()
+            .any(|account| account.entry.name == spec.name)
+        {
+            return Err(AdminError::Duplicate);
+        }
+        let uid = match spec.uid {
+            Some(uid) => uid,
+            None => next_id(self.accounts.iter().map(|account| account.entry.uid))
+                .ok_or(AdminError::Limit)?,
+        };
+        if self.accounts.iter().any(|account| account.entry.uid == uid) {
+            return Err(AdminError::Duplicate);
+        }
+        if uid == 0 && spec.capabilities & CAP_ACCOUNT_ADMIN == 0 {
+            return Err(AdminError::InvalidInput);
+        }
+        let gid = spec.primary_gid.ok_or(AdminError::InvalidInput)?;
+        if !self.groups.iter().any(|group| group.gid == gid) {
+            return Err(AdminError::InvalidId);
+        }
+        validate_group_names(self, &spec.supplementary_groups)?;
+        if uid == 0 && spec.capabilities & CAP_ACCOUNT_ADMIN == 0 {
+            return Err(AdminError::InvalidInput);
+        }
+        let encoded = hasher.hash(password).ok_or(AdminError::InvalidHash)?;
+        validate_password_hash(encoded.as_bytes()).map_err(|_| AdminError::InvalidHash)?;
+        let mut candidate_groups = self.groups.clone();
+        set_membership(
+            &mut candidate_groups,
+            &spec.name,
+            &spec.supplementary_groups,
+        )?;
+        let account = Account {
+            entry: UserEntry {
+                name: spec.name,
+                uid,
+                gid,
+                flags: spec.flags,
+                capabilities: spec.capabilities,
+                home: spec.home.ok_or(AdminError::InvalidInput)?,
+                shell: spec.shell.ok_or(AdminError::InvalidInput)?,
+            },
+            password_hash: encoded,
+        };
+        self.accounts.push(account);
+        self.groups = candidate_groups;
+        Ok(uid)
+    }
+
+    pub fn create_locked_user(
+        &mut self,
+        actor: SessionCredentials,
+        spec: UserSpec,
+    ) -> Result<u32, AdminError> {
+        require_admin(actor)?;
+        let mut spec = spec;
+        spec.flags |= FLAG_LOCKED;
+        self.create_user_with_hash(actor, spec, LOCKED_PASSWORD_HASH)
+    }
+
+    fn create_user_with_hash(
+        &mut self,
+        actor: SessionCredentials,
+        spec: UserSpec,
+        encoded: &str,
+    ) -> Result<u32, AdminError> {
+        require_admin(actor)?;
+        if self.accounts.len() == MAX_USERS {
+            return Err(AdminError::Limit);
+        }
+        validate_user_fields(
+            &spec.name,
+            spec.flags,
+            spec.capabilities,
+            spec.home.as_deref(),
+            spec.shell.as_deref(),
+        )?;
+        if self
+            .accounts
+            .iter()
+            .any(|account| account.entry.name == spec.name)
+        {
+            return Err(AdminError::Duplicate);
+        }
+        let uid = match spec.uid {
+            Some(uid) => uid,
+            None => next_id(self.accounts.iter().map(|account| account.entry.uid))
+                .ok_or(AdminError::Limit)?,
+        };
+        if self.accounts.iter().any(|account| account.entry.uid == uid) {
+            return Err(AdminError::Duplicate);
+        }
+        let gid = spec.primary_gid.ok_or(AdminError::InvalidInput)?;
+        if !self.groups.iter().any(|group| group.gid == gid) {
+            return Err(AdminError::InvalidId);
+        }
+        validate_group_names(self, &spec.supplementary_groups)?;
+        validate_password_hash(encoded.as_bytes()).map_err(|_| AdminError::InvalidHash)?;
+        let name = spec.name.clone();
+        let mut candidate_groups = self.groups.clone();
+        set_membership(&mut candidate_groups, &name, &spec.supplementary_groups)?;
+        let account = Account {
+            entry: UserEntry {
+                name: spec.name,
+                uid,
+                gid,
+                flags: spec.flags,
+                capabilities: spec.capabilities,
+                home: spec.home.ok_or(AdminError::InvalidInput)?,
+                shell: spec.shell.ok_or(AdminError::InvalidInput)?,
+            },
+            password_hash: encoded.into(),
+        };
+        self.accounts.push(account);
+        self.groups = candidate_groups;
+        Ok(uid)
+    }
+
+    pub fn modify_user(
+        &mut self,
+        actor: SessionCredentials,
+        target_uid: u32,
+        update: UserUpdate,
+    ) -> Result<(), AdminError> {
+        require_admin(actor)?;
+        let index = self
+            .accounts
+            .iter()
+            .position(|account| account.entry.uid == target_uid)
+            .ok_or(AdminError::NotFound)?;
+        let current = self.accounts[index].entry.clone();
+        let name = update.name.as_ref().unwrap_or(&current.name);
+        let home = update.home.as_deref().unwrap_or(current.home.as_str());
+        let shell = update.shell.as_deref().unwrap_or(current.shell.as_str());
+        validate_user_fields(
+            name,
+            update.flags.unwrap_or(current.flags),
+            update.capabilities.unwrap_or(current.capabilities),
+            Some(home),
+            Some(shell),
+        )?;
+        if self
+            .accounts
+            .iter()
+            .enumerate()
+            .any(|(other, account)| other != index && account.entry.name == *name)
+        {
+            return Err(AdminError::Duplicate);
+        }
+        if let Some(gid) = update.primary_gid {
+            if !self.groups.iter().any(|group| group.gid == gid) {
+                return Err(AdminError::InvalidId);
+            }
+        }
+        if let Some(groups) = &update.supplementary_groups {
+            validate_group_names(self, groups)?;
+        }
+        let old_name = current.name.clone();
+        let new_name = name.to_owned();
+        let groups = update.supplementary_groups.clone();
+        let mut candidate_groups = self.groups.clone();
+        if let Some(groups) = &groups {
+            set_membership(&mut candidate_groups, &old_name, &[])?;
+            set_membership(&mut candidate_groups, &new_name, groups)?;
+        } else if old_name != new_name {
+            for group in &mut candidate_groups {
+                for member in &mut group.members {
+                    if *member == old_name {
+                        *member = new_name.clone();
+                    }
+                }
+            }
+        }
+        let entry = &mut self.accounts[index].entry;
+        entry.name = new_name.clone();
+        entry.gid = update.primary_gid.unwrap_or(entry.gid);
+        entry.home = home.to_owned();
+        entry.shell = shell.to_owned();
+        if let Some(flags) = update.flags {
+            entry.flags = flags;
+        }
+        if let Some(capabilities) = update.capabilities {
+            entry.capabilities = capabilities;
+        }
+        self.groups = candidate_groups;
+        Ok(())
+    }
+
+    pub fn delete_user(
+        &mut self,
+        actor: SessionCredentials,
+        target_uid: u32,
+    ) -> Result<(), AdminError> {
+        require_admin(actor)?;
+        let index = self
+            .accounts
+            .iter()
+            .position(|account| account.entry.uid == target_uid)
+            .ok_or(AdminError::NotFound)?;
+        if target_uid == actor.effective_uid || target_uid == 0 {
+            return Err(AdminError::PermissionDenied);
+        }
+        let name = self.accounts[index].entry.name.clone();
+        self.accounts.remove(index);
+        for group in &mut self.groups {
+            group.members.retain(|member| member != &name);
+        }
+        Ok(())
+    }
+
+    pub fn transact_admin<S: AtomicStorage, F>(
+        &mut self,
+        actor: SessionCredentials,
+        storage: &mut S,
+        committed_path: &[u8],
+        temp_path: &[u8],
+        operation: F,
+    ) -> Result<(), AdminError>
+    where
+        F: FnOnce(&mut Database) -> Result<(), AdminError>,
+    {
+        self.transact_admin_with(actor, storage, committed_path, temp_path, operation)
+            .map(|_| ())
+    }
+
+    pub fn transact_admin_with<S: AtomicStorage, F, R>(
+        &mut self,
+        actor: SessionCredentials,
+        storage: &mut S,
+        committed_path: &[u8],
+        temp_path: &[u8],
+        operation: F,
+    ) -> Result<R, AdminError>
+    where
+        F: FnOnce(&mut Database) -> Result<R, AdminError>,
+    {
+        require_admin(actor)?;
+        let mut candidate = self.clone();
+        let result = operation(&mut candidate)?;
+        atomic_replace(storage, committed_path, temp_path, &candidate)
+            .map_err(AdminError::Storage)?;
+        *self = candidate;
+        Ok(result)
     }
 
     pub fn serialize_for_storage(&self) -> Result<Vec<u8>, SerializeError> {
@@ -740,9 +1141,116 @@ fn append_fields(output: &mut Vec<u8>, fields: &[&[u8]]) -> Result<(), Serialize
     Ok(())
 }
 
+fn require_admin(actor: SessionCredentials) -> Result<(), AdminError> {
+    if actor.has_capability(CAP_ACCOUNT_ADMIN) {
+        Ok(())
+    } else {
+        Err(AdminError::PermissionDenied)
+    }
+}
+
+fn validate_name_string(value: &str) -> Result<(), AdminError> {
+    parse_name(value.as_bytes())
+        .map(|_| ())
+        .map_err(|_| AdminError::InvalidInput)
+}
+
+fn validate_path_string(value: &str) -> Result<(), AdminError> {
+    parse_path(value.as_bytes())
+        .map(|_| ())
+        .map_err(|_| AdminError::InvalidInput)
+}
+
+fn validate_user_fields(
+    name: &str,
+    flags: u32,
+    capabilities: u64,
+    home: Option<&str>,
+    shell: Option<&str>,
+) -> Result<(), AdminError> {
+    validate_name_string(name)?;
+    if flags & !KNOWN_FLAGS != 0 || capabilities & !KNOWN_CAPABILITIES != 0 {
+        return Err(AdminError::InvalidInput);
+    }
+    validate_path_string(home.ok_or(AdminError::InvalidInput)?)?;
+    validate_path_string(shell.ok_or(AdminError::InvalidInput)?)?;
+    Ok(())
+}
+
+fn validate_group_members(database: &Database, members: &[String]) -> Result<(), AdminError> {
+    if members.len() > MAX_USERS
+        || members.iter().any(|member| {
+            validate_name_string(member).is_err()
+                || !database
+                    .accounts
+                    .iter()
+                    .any(|account| account.entry.name == *member)
+        })
+        || members
+            .iter()
+            .enumerate()
+            .any(|(index, member)| members[..index].iter().any(|other| other == member))
+    {
+        return Err(AdminError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_group_names(database: &Database, groups: &[String]) -> Result<(), AdminError> {
+    if groups.len() > MAX_GROUPS
+        || groups.iter().any(|name| {
+            validate_name_string(name).is_err()
+                || !database.groups.iter().any(|group| group.name == *name)
+        })
+        || groups
+            .iter()
+            .enumerate()
+            .any(|(index, name)| groups[..index].iter().any(|other| other == name))
+    {
+        return Err(AdminError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn set_membership(
+    groups: &mut [GroupEntry],
+    user: &str,
+    supplementary: &[String],
+) -> Result<(), AdminError> {
+    for group in groups.iter() {
+        if supplementary.iter().any(|name| name == &group.name)
+            && group.members.len() == MAX_USERS
+            && !group.members.iter().any(|member| member == user)
+        {
+            return Err(AdminError::Limit);
+        }
+    }
+    for group in groups {
+        group.members.retain(|member| member != user);
+        if supplementary.iter().any(|name| name == &group.name) {
+            group.members.push(user.to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn next_id<I: Iterator<Item = u32> + Clone>(values: I) -> Option<u32> {
+    let mut candidate = FIRST_DYNAMIC_ID;
+    loop {
+        if !values.clone().any(|value| value == candidate) {
+            return Some(candidate);
+        }
+        if candidate == u32::MAX {
+            return None;
+        }
+        candidate += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     const HASH: &[u8] = b"$argon2id$v=19$m=65536,t=3,p=1$c2FsdFNhbXBsZQ$ZGlnaWVzdFNhbXBsZQ";
     const DATABASE: &[u8] = b"NORX-USERDB 1\nu:alice:1000:1000:0:0:/users/alice:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$c2FsdFNhbXBsZQ$ZGlnaWVzdFNhbXBsZQ\ng:users:1000:alice\n";
@@ -1072,6 +1580,188 @@ mod tests {
         storage.unlock().unwrap();
         atomic_replace(&mut storage, b"db", b"tmp", &database).unwrap();
         assert!(storage.committed.is_some());
+    }
+
+    #[test]
+    fn administrator_can_manage_users_groups_and_membership() {
+        let mut database = Database::parse(DATABASE).unwrap();
+        let root = SessionCredentials {
+            real_uid: 0,
+            effective_uid: 0,
+            saved_uid: 0,
+            real_gid: 0,
+            effective_gid: 0,
+            saved_gid: 0,
+            capabilities: CAP_ACCOUNT_ADMIN,
+        };
+        let alice = SessionCredentials::from_user(&database.lookup_user(b"alice").unwrap());
+
+        assert_eq!(
+            database.create_group(alice, String::from("operators"), None, Vec::new()),
+            Err(AdminError::PermissionDenied)
+        );
+        let operators = database
+            .create_group(root, String::from("operators"), None, Vec::new())
+            .unwrap();
+        assert_eq!(operators, 1000 + 1);
+        assert_eq!(
+            database.create_group(root, String::from("operators"), Some(2000), Vec::new()),
+            Err(AdminError::Duplicate)
+        );
+        assert_eq!(
+            database.create_group(root, String::from("bad:name"), None, Vec::new()),
+            Err(AdminError::InvalidInput)
+        );
+
+        let bob = database
+            .create_user(
+                root,
+                UserSpec {
+                    name: String::from("bob"),
+                    uid: None,
+                    primary_gid: Some(operators),
+                    supplementary_groups: vec![String::from("users")],
+                    home: Some(String::from("/users/bob")),
+                    shell: Some(String::from("/bin/nsh")),
+                    flags: 0,
+                    capabilities: 0,
+                },
+                b"newpass!",
+                &Hasher,
+            )
+            .unwrap();
+        assert_eq!(bob, 1001);
+        assert!(database
+            .lookup_group(b"users")
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member == "bob"));
+        assert_eq!(
+            database.create_user(
+                root,
+                UserSpec {
+                    name: String::from("bob"),
+                    uid: Some(2000),
+                    primary_gid: Some(operators),
+                    supplementary_groups: Vec::new(),
+                    home: Some(String::from("/users/bob2")),
+                    shell: Some(String::from("/bin/nsh")),
+                    flags: 0,
+                    capabilities: 0,
+                },
+                b"newpass!",
+                &Hasher,
+            ),
+            Err(AdminError::Duplicate)
+        );
+        database
+            .modify_user(
+                root,
+                bob,
+                UserUpdate {
+                    name: Some(String::from("bobby")),
+                    supplementary_groups: Some(vec![String::from("operators")]),
+                    flags: Some(FLAG_DISABLED),
+                    ..UserUpdate::default()
+                },
+            )
+            .unwrap();
+        assert!(database.lookup_user(b"bobby").unwrap().flags & FLAG_DISABLED != 0);
+        assert!(database
+            .lookup_group(b"operators")
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member == "bobby"));
+        assert!(!database
+            .lookup_group(b"users")
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member == "bobby"));
+        assert_eq!(
+            database.delete_group(root, operators),
+            Err(AdminError::PermissionDenied)
+        );
+        database.delete_user(root, bob).unwrap();
+        database.delete_group(root, operators).unwrap();
+        assert!(database.lookup_user(b"bobby").is_none());
+    }
+
+    #[test]
+    fn locked_creation_has_no_usable_password_and_validates_groups() {
+        let mut database = Database::parse(DATABASE).unwrap();
+        let root = SessionCredentials {
+            capabilities: CAP_ACCOUNT_ADMIN,
+            ..SessionCredentials::from_user(&database.lookup_user(b"alice").unwrap())
+        };
+        let uid = database
+            .create_locked_user(
+                root,
+                UserSpec {
+                    name: String::from("service"),
+                    uid: None,
+                    primary_gid: Some(1000),
+                    supplementary_groups: vec![String::from("users")],
+                    home: Some(String::from("/users/service")),
+                    shell: Some(String::from("/bin/false")),
+                    flags: 0,
+                    capabilities: 0,
+                },
+            )
+            .unwrap();
+        let user = database.lookup_user(b"service").unwrap();
+        assert_eq!(user.uid, uid);
+        assert!(user.flags & FLAG_LOCKED != 0);
+        assert_eq!(
+            database.authenticate(b"service", b"anything", &Verifier),
+            Err(AuthError::Denied)
+        );
+        assert_eq!(
+            database.create_locked_user(
+                root,
+                UserSpec {
+                    name: String::from("broken"),
+                    uid: None,
+                    primary_gid: Some(1000),
+                    supplementary_groups: vec![String::from("missing")],
+                    home: Some(String::from("/users/broken")),
+                    shell: Some(String::from("/bin/false")),
+                    flags: 0,
+                    capabilities: 0,
+                },
+            ),
+            Err(AdminError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn admin_transaction_rolls_back_memory_when_storage_fails() {
+        let mut database = Database::parse(DATABASE).unwrap();
+        let before = database.clone();
+        let root = SessionCredentials {
+            capabilities: CAP_ACCOUNT_ADMIN,
+            ..SessionCredentials::from_user(&database.lookup_user(b"alice").unwrap())
+        };
+        let mut storage = MemoryStorage {
+            unavailable: true,
+            ..MemoryStorage::default()
+        };
+        assert_eq!(
+            database.transact_admin(root, &mut storage, b"db", b"tmp", |candidate| {
+                candidate.modify_user(
+                    root,
+                    1000,
+                    UserUpdate {
+                        shell: Some(String::from("/bin/true")),
+                        ..UserUpdate::default()
+                    },
+                )
+            },),
+            Err(AdminError::Storage(StorageError::Unavailable))
+        );
+        assert_eq!(database, before);
     }
 
     #[test]

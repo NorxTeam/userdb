@@ -73,6 +73,18 @@ performed only by an injected password-verifier implementation.
   bounded in-memory decision state; callers must serialize it together with
   the account update through `atomic_replace` if lockout persistence is
   required.
+- Administrative user/group operations are exposed as bounded methods:
+  `create_user`, `modify_user`, `delete_user`, `create_group`,
+  `modify_group`, `delete_group`, `list_users`, and `list_groups`. They require
+  the explicit `account-admin` capability; UID 0 alone is insufficient.
+  Automatic IDs start at 1000, explicit IDs are checked for duplicates, user
+  names/paths/flags/capabilities are revalidated, supplementary memberships
+  refer only to existing groups, and primary groups cannot be deleted while
+  referenced. Deleting a user removes its supplementary memberships.
+- `Database::transact_admin` applies an administrative closure to a clone and
+  publishes it through `atomic_replace` only after the complete candidate is
+  valid. A failed operation, serialization, lock, sync, or rename leaves both
+  the in-memory database and committed storage unchanged.
 - `AtomicStorage` makes writer locking and file/directory sync explicit. A
   failed write, sync, or rename never publishes a partial database; recovery
   promotes a valid temporary file only while holding the writer lock.
