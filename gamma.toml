@@ -17,12 +17,11 @@ maintained_fork = "https://github.com/NorxTeam/userdb.git"
 
 [build]
 script = "norx/scripts/build.py"
-targets = ["x86_64-unknown-norx", "aarch64-unknown-norx"]
+targets = ["aarch64-unknown-norx"]
 dependencies = ["userspace"]
 
 [outputs]
 files = [
-  "tests/userdb/x86_64-unknown-norx/userdb-smoke.elf",
   "tests/userdb/aarch64-unknown-norx/userdb-smoke.elf",
   "var/lib/userdb/manifest.toml",
 ]
