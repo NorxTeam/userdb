@@ -28,7 +28,7 @@ The file is UTF-8-free byte data with ASCII structural fields and this header:
 
 ```text
 NORX-USERDB 1
-u:<name>:<uid>:<gid>:<flags>:<capabilities>:<home>:<shell>:<argon2id-phc>
+u:<name>:<uid>:<gid>:<flags>:<capabilities>:<home>:<shell>:<argon2id-phc-or-NO_PASSWORD>
 g:<name>:<gid>:<comma-separated-members-or->
 ```
 
@@ -46,15 +46,25 @@ bit 9 for `session-admin`; the kernel credentials ABI must publish these bits
 before a service can transfer them across a process boundary.
 
 Password fields must be Argon2id PHC strings with fixed policy parameters:
-`m=65536,t=3,p=1`, bounded salt/digest fields, and no alternate password
-scheme. The parser validates the encoded policy; cryptographic verification is
-performed only by an injected password-verifier implementation.
+`m=65536,t=3,p=1`, an exactly 16-byte salt and 32-byte digest encoded as
+unpadded standard base64, or the literal `NO_PASSWORD`.
+The latter is an explicit passwordless state used by `create_locked_user`; it
+never verifies successfully, including after `set_locked(false)`, and must be
+replaced by an administrator password reset before login can succeed. The
+parser also canonicalizes the former fixed locked-user sentinel to
+`NO_PASSWORD`, so existing databases cannot turn that value into a credential
+when unlocked. Cryptographic verification is performed only by an injected
+password-verifier implementation.
 
 ## API and security rules
 
 - `Database::lookup_user` returns `UserEntry` without a password hash.
 - `Database::authenticate` returns generic denial for unknown, disabled,
-  locked, expired, malformed, or failed accounts to avoid account enumeration.
+  locked, expired, passwordless, malformed, or failed accounts to avoid
+  account enumeration. It invokes `PasswordVerifier` exactly once for every
+  eligible authentication attempt: a found account uses its stored hash, while
+  an unknown or passwordless account uses the fixed-policy
+  `DUMMY_PASSWORD_HASH`; the result is discarded for denied account states.
 - `SessionCredentials::from_user` initializes real/effective/saved UID/GID
   from the account and copies only explicitly mapped capabilities.
 - Child processes inherit the complete credential tuple; no ambient capability
@@ -69,6 +79,9 @@ performed only by an injected password-verifier implementation.
   password for non-administrators, rejects password reuse, and validates the
   hasher's resulting PHC string before mutating memory. `None` for the old
   password is accepted only for `account-admin` reset.
+- `Database::create_user` applies the same default password policy before
+  invoking the hasher, so empty, short, oversized, NUL-containing, and
+  newline-containing passwords cannot consume hashing work or enter storage.
 - `Database::set_locked` is a separate privileged operation. `Lockout` is a
   bounded in-memory decision state; callers must serialize it together with
   the account update through `atomic_replace` if lockout persistence is
@@ -84,10 +97,18 @@ performed only by an injected password-verifier implementation.
 - `Database::transact_admin` applies an administrative closure to a clone and
   publishes it through `atomic_replace` only after the complete candidate is
   valid. A failed operation, serialization, lock, sync, or rename leaves both
-  the in-memory database and committed storage unchanged.
+  the in-memory database and committed storage unchanged. If replacement and
+  directory sync succeed but unlocking fails, it returns
+  `StorageError::CommittedButUnlockFailed` and reconciles the in-memory
+  database to the committed candidate; callers must reload/reconcile before
+  retrying.
 - `AtomicStorage` makes writer locking and file/directory sync explicit. A
   failed write, sync, or rename never publishes a partial database; recovery
-  promotes a valid temporary file only while holding the writer lock.
+  promotes a valid temporary file only while holding the writer lock. A
+  successful replacement followed by an unlock failure is reported as
+  `CommittedButUnlockFailed`; callers must use `load_with_recovery` before a
+  retry. `passwd` propagates this state as
+  `PasswdError::CommittedButUnlockFailed`.
 
 The exported ABI is the Rust API in `norx/src/lib.rs`; C-facing login and
 administration wrappers are intentionally deferred until the stable Norx

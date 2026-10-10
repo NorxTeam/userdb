@@ -12,7 +12,7 @@ use userspace::syscall;
 
 const DATABASE_PATH: &[u8] = b"/cfg/userdb/users.db";
 const TEMP_PATH: &[u8] = b"/cfg/userdb/users.db.tmp";
-const SEED: &[u8] = b"NORX-USERDB 1\nu:alice:1000:1000:0:0:/users/alice:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$c2FsdFNhbXBsZQ$ZGlnaWVzdFNhbXBsZQ\ng:users:1000:alice\n";
+const SEED: &[u8] = b"NORX-USERDB 1\nu:alice:1000:1000:0:0:/users/alice:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY\ng:users:1000:alice\n";
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {

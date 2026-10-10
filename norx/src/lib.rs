@@ -16,6 +16,8 @@ pub const MAX_NAME_BYTES: usize = 31;
 pub const MAX_PATH_BYTES: usize = 255;
 pub const MAX_HASH_BYTES: usize = 256;
 pub const MAX_PASSWORD_BYTES: usize = 128;
+const ARGON2_SALT_BYTES: usize = 16;
+const ARGON2_DIGEST_BYTES: usize = 32;
 pub const FLAG_DISABLED: u32 = 1 << 0;
 pub const FLAG_LOCKED: u32 = 1 << 1;
 pub const FLAG_EXPIRED: u32 = 1 << 2;
@@ -24,8 +26,13 @@ pub const CAP_ACCOUNT_ADMIN: u64 = 1 << 8;
 pub const CAP_SESSION_ADMIN: u64 = 1 << 9;
 pub const KNOWN_CAPABILITIES: u64 = CAP_ACCOUNT_ADMIN | CAP_SESSION_ADMIN;
 pub const ARGON2ID_PREFIX: &[u8] = b"$argon2id$v=19$m=65536,t=3,p=1$";
-pub const LOCKED_PASSWORD_HASH: &str =
-    "$argon2id$v=19$m=65536,t=3,p=1$bG9ja2VkLXNlbnRpbmVs$bm90LWEtcGFzc3dvcmQ=";
+pub const NO_PASSWORD: &str = "NO_PASSWORD";
+const LEGACY_LOCKED_PASSWORD_HASH: &[u8] =
+    b"$argon2id$v=19$m=65536,t=3,p=1$bG9ja2VkLXNlbnRpbmVs$bm90LWEtcGFzc3dvcmQ=";
+/// Fixed-policy hash used for authentication attempts without an account hash.
+/// Its verification result is always discarded.
+pub const DUMMY_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=65536,t=3,p=1$bm9yeC1hdXRoLWR1bW15IQ$bm9yeC1hdXRoLWR1bW15LWRpZ2VzdC0wMDAwMDAwMHg";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
@@ -121,7 +128,7 @@ pub struct GroupEntry {
 #[derive(Clone, PartialEq, Eq)]
 struct Account {
     entry: UserEntry,
-    password_hash: String,
+    password_hash: Option<String>,
 }
 
 impl fmt::Debug for Account {
@@ -141,6 +148,8 @@ pub struct Database {
 }
 
 pub trait PasswordVerifier {
+    /// Verify with the normal bounded work factor, including for
+    /// `DUMMY_PASSWORD_HASH`; callers discard dummy verification results.
     fn verify(&self, password: &[u8], encoded_hash: &[u8]) -> bool;
 }
 
@@ -160,19 +169,18 @@ impl PasswordPolicy {
         max_length: MAX_PASSWORD_BYTES,
     };
 
-    fn validate(self, password: &[u8], confirmation: &[u8]) -> Result<(), PasswordChangeError> {
+    fn validate_policy(self) -> Result<(), PasswordChangeError> {
         if self.min_length == 0
             || self.min_length > self.max_length
             || self.max_length > MAX_PASSWORD_BYTES
         {
             return Err(PasswordChangeError::InvalidPolicy);
         }
-        if password.len() > self.max_length || confirmation.len() > self.max_length {
-            return Err(PasswordChangeError::InvalidPassword);
-        }
-        if !constant_time_equal(password, confirmation) {
-            return Err(PasswordChangeError::ConfirmationMismatch);
-        }
+        Ok(())
+    }
+
+    fn validate_password(self, password: &[u8]) -> Result<(), PasswordChangeError> {
+        self.validate_policy()?;
         if password.len() < self.min_length
             || password.len() > self.max_length
             || password
@@ -182,6 +190,17 @@ impl PasswordPolicy {
             return Err(PasswordChangeError::InvalidPassword);
         }
         Ok(())
+    }
+
+    fn validate(self, password: &[u8], confirmation: &[u8]) -> Result<(), PasswordChangeError> {
+        self.validate_policy()?;
+        if password.len() > self.max_length || confirmation.len() > self.max_length {
+            return Err(PasswordChangeError::InvalidPassword);
+        }
+        if !constant_time_equal(password, confirmation) {
+            return Err(PasswordChangeError::ConfirmationMismatch);
+        }
+        self.validate_password(password)
     }
 }
 
@@ -304,11 +323,15 @@ impl Database {
             .iter()
             .find(|account| account.entry.name.as_bytes() == name)
         else {
+            let _ = verifier.verify(password, DUMMY_PASSWORD_HASH.as_bytes());
             return Err(AuthError::Denied);
         };
-        if !account.entry.is_enabled()
-            || !verifier.verify(password, account.password_hash.as_bytes())
-        {
+        let (password_hash, has_password) = match account.password_hash.as_deref() {
+            Some(password_hash) => (password_hash, true),
+            None => (DUMMY_PASSWORD_HASH, false),
+        };
+        let verified = verifier.verify(password, password_hash.as_bytes());
+        if !has_password || !account.entry.is_enabled() || !verified {
             return Err(AuthError::Denied);
         }
         Ok(SessionCredentials::from_user(&account.entry))
@@ -355,19 +378,26 @@ impl Database {
             let Some(old_password) = old_password else {
                 return Err(PasswordChangeError::OldPasswordRejected);
             };
-            if !verifier.verify(old_password, self.accounts[index].password_hash.as_bytes()) {
+            let Some(password_hash) = self.accounts[index].password_hash.as_deref() else {
+                return Err(PasswordChangeError::OldPasswordRejected);
+            };
+            if !verifier.verify(old_password, password_hash.as_bytes()) {
                 return Err(PasswordChangeError::OldPasswordRejected);
             }
         }
         policy.validate(new_password, confirmation)?;
-        if verifier.verify(new_password, self.accounts[index].password_hash.as_bytes()) {
+        if self.accounts[index]
+            .password_hash
+            .as_deref()
+            .is_some_and(|password_hash| verifier.verify(new_password, password_hash.as_bytes()))
+        {
             return Err(PasswordChangeError::PasswordReuse);
         }
         let encoded = hasher
             .hash(new_password)
             .ok_or(PasswordChangeError::HashFailed)?;
         validate_password_hash(encoded.as_bytes()).map_err(|_| PasswordChangeError::InvalidHash)?;
-        self.accounts[index].password_hash = encoded;
+        self.accounts[index].password_hash = Some(encoded);
         Ok(())
     }
 
@@ -488,6 +518,9 @@ impl Database {
         hasher: &H,
     ) -> Result<u32, AdminError> {
         require_admin(actor)?;
+        PasswordPolicy::DEFAULT
+            .validate_password(password)
+            .map_err(|_| AdminError::InvalidInput)?;
         if self.accounts.len() == MAX_USERS {
             return Err(AdminError::Limit);
         }
@@ -542,7 +575,7 @@ impl Database {
                 home: spec.home.ok_or(AdminError::InvalidInput)?,
                 shell: spec.shell.ok_or(AdminError::InvalidInput)?,
             },
-            password_hash: encoded,
+            password_hash: Some(encoded),
         };
         self.accounts.push(account);
         self.groups = candidate_groups;
@@ -557,14 +590,14 @@ impl Database {
         require_admin(actor)?;
         let mut spec = spec;
         spec.flags |= FLAG_LOCKED;
-        self.create_user_with_hash(actor, spec, LOCKED_PASSWORD_HASH)
+        self.create_user_with_hash(actor, spec, None)
     }
 
     fn create_user_with_hash(
         &mut self,
         actor: SessionCredentials,
         spec: UserSpec,
-        encoded: &str,
+        encoded: Option<&str>,
     ) -> Result<u32, AdminError> {
         require_admin(actor)?;
         if self.accounts.len() == MAX_USERS {
@@ -597,7 +630,9 @@ impl Database {
             return Err(AdminError::InvalidId);
         }
         validate_group_names(self, &spec.supplementary_groups)?;
-        validate_password_hash(encoded.as_bytes()).map_err(|_| AdminError::InvalidHash)?;
+        if let Some(encoded) = encoded {
+            validate_password_hash(encoded.as_bytes()).map_err(|_| AdminError::InvalidHash)?;
+        }
         let name = spec.name.clone();
         let mut candidate_groups = self.groups.clone();
         set_membership(&mut candidate_groups, &name, &spec.supplementary_groups)?;
@@ -611,7 +646,7 @@ impl Database {
                 home: spec.home.ok_or(AdminError::InvalidInput)?,
                 shell: spec.shell.ok_or(AdminError::InvalidInput)?,
             },
-            password_hash: encoded.into(),
+            password_hash: encoded.map(str::to_owned),
         };
         self.accounts.push(account);
         self.groups = candidate_groups;
@@ -739,8 +774,15 @@ impl Database {
         require_admin(actor)?;
         let mut candidate = self.clone();
         let result = operation(&mut candidate)?;
-        atomic_replace(storage, committed_path, temp_path, &candidate)
-            .map_err(AdminError::Storage)?;
+        match atomic_replace(storage, committed_path, temp_path, &candidate) {
+            Ok(()) => {}
+            Err(StorageError::CommittedButUnlockFailed) => {
+                // The candidate is the only state known to have been committed.
+                *self = candidate;
+                return Err(AdminError::Storage(StorageError::CommittedButUnlockFailed));
+            }
+            Err(error) => return Err(AdminError::Storage(error)),
+        }
         *self = candidate;
         Ok(result)
     }
@@ -761,7 +803,11 @@ impl Database {
                     decimal(account.entry.capabilities).as_slice(),
                     account.entry.home.as_bytes(),
                     account.entry.shell.as_bytes(),
-                    account.password_hash.as_bytes(),
+                    account
+                        .password_hash
+                        .as_deref()
+                        .unwrap_or(NO_PASSWORD)
+                        .as_bytes(),
                 ],
             )?;
         }
@@ -834,6 +880,7 @@ pub enum StorageError {
     Busy,
     Corrupt,
     TooLarge,
+    CommittedButUnlockFailed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -870,7 +917,8 @@ pub fn atomic_replace<S: AtomicStorage>(
     })();
     let unlock = storage.unlock();
     match (result, unlock) {
-        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(_)) => Err(StorageError::CommittedButUnlockFailed),
         (Ok(value), Ok(())) => Ok(value),
     }
 }
@@ -915,7 +963,8 @@ fn recover_temp<S: AtomicStorage>(
     })();
     let unlock = storage.unlock();
     match (result, unlock) {
-        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(_)) => Err(StorageError::CommittedButUnlockFailed),
         (Ok(value), Ok(())) => Ok(value),
     }
 }
@@ -968,7 +1017,13 @@ fn parse_account(fields: &[&[u8]]) -> Result<Account, ParseError> {
     }
     let home = parse_path(fields[6])?;
     let shell = parse_path(fields[7])?;
-    validate_password_hash(fields[8])?;
+    let password_hash =
+        if fields[8] == NO_PASSWORD.as_bytes() || fields[8] == LEGACY_LOCKED_PASSWORD_HASH {
+            None
+        } else {
+            validate_password_hash(fields[8])?;
+            Some(to_string(fields[8])?)
+        };
     Ok(Account {
         entry: UserEntry {
             name,
@@ -979,7 +1034,7 @@ fn parse_account(fields: &[&[u8]]) -> Result<Account, ParseError> {
             home,
             shell,
         },
-        password_hash: to_string(fields[8])?,
+        password_hash,
     })
 }
 
@@ -1029,6 +1084,9 @@ fn parse_path(value: &[u8]) -> Result<String, ParseError> {
         || value
             .iter()
             .any(|byte| *byte < 0x20 || *byte == b':' || *byte == b'\n')
+        || value
+            .split(|byte| *byte == b'/')
+            .any(|component| component == b"." || component == b"..")
     {
         return Err(ParseError::InvalidPath);
     }
@@ -1070,14 +1128,19 @@ fn parse_u64(value: &[u8]) -> Result<u64, ParseError> {
 }
 
 fn validate_password_hash(value: &[u8]) -> Result<(), ParseError> {
-    if value.len() < ARGON2ID_PREFIX.len() + 16 || value.len() > MAX_HASH_BYTES {
+    if value.len() > MAX_HASH_BYTES {
         return Err(ParseError::InvalidHash);
     }
-    if !value.starts_with(ARGON2ID_PREFIX) {
+
+    let mut parts = value.split(|byte| *byte == b'$');
+    if parts.next() != Some(b"")
+        || parts.next() != Some(b"argon2id")
+        || parts.next() != Some(b"v=19")
+        || parts.next() != Some(b"m=65536,t=3,p=1")
+    {
         return Err(ParseError::InvalidHash);
     }
-    let rest = &value[ARGON2ID_PREFIX.len()..];
-    let mut parts = rest.split(|byte| *byte == b'$');
+
     let Some(salt) = parts.next() else {
         return Err(ParseError::InvalidHash);
     };
@@ -1085,14 +1148,45 @@ fn validate_password_hash(value: &[u8]) -> Result<(), ParseError> {
         return Err(ParseError::InvalidHash);
     };
     if parts.next().is_some()
-        || salt.len() < 8
-        || digest.len() < 16
-        || !salt.iter().all(|byte| is_base64(*byte))
-        || !digest.iter().all(|byte| is_base64(*byte))
+        || !validate_base64_field(salt, ARGON2_SALT_BYTES)
+        || !validate_base64_field(digest, ARGON2_DIGEST_BYTES)
     {
         return Err(ParseError::InvalidHash);
     }
     Ok(())
+}
+
+fn validate_base64_field(value: &[u8], decoded_len: usize) -> bool {
+    let encoded_len = (decoded_len / 3) * 4
+        + match decoded_len % 3 {
+            0 => 0,
+            1 => 2,
+            _ => 3,
+        };
+    if value.len() != encoded_len {
+        return false;
+    }
+    for byte in value {
+        if base64_value(*byte).is_none() {
+            return false;
+        }
+    }
+    match decoded_len % 3 {
+        0 => true,
+        1 => base64_value(value[value.len() - 1]).is_some_and(|last| last & 0x0f == 0),
+        _ => base64_value(value[value.len() - 1]).is_some_and(|last| last & 0x03 == 0),
+    }
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
@@ -1102,10 +1196,6 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
             ^ usize::from(right.get(index).copied().unwrap_or(0));
     }
     difference == 0
-}
-
-const fn is_base64(byte: u8) -> bool {
-    matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=')
 }
 
 fn to_string(value: &[u8]) -> Result<String, ParseError> {
@@ -1251,14 +1341,39 @@ fn next_id<I: Iterator<Item = u32> + Clone>(values: I) -> Option<u32> {
 mod tests {
     use super::*;
     use alloc::vec;
+    use core::cell::Cell;
 
-    const HASH: &[u8] = b"$argon2id$v=19$m=65536,t=3,p=1$c2FsdFNhbXBsZQ$ZGlnaWVzdFNhbXBsZQ";
-    const DATABASE: &[u8] = b"NORX-USERDB 1\nu:alice:1000:1000:0:0:/users/alice:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$c2FsdFNhbXBsZQ$ZGlnaWVzdFNhbXBsZQ\ng:users:1000:alice\n";
+    const HASH: &[u8] = b"$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
+    const NEW_HASH: &[u8] =
+        b"$argon2id$v=19$m=65536,t=3,p=1$bmV3LXNhbHQtdmFsdWUhIQ$bmV3LWRpZ2VzdC12YWx1ZS0wMTIzNDU2Nzg5YWJjZGU";
+    const DATABASE: &[u8] = b"NORX-USERDB 1\nu:alice:1000:1000:0:0:/users/alice:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY\ng:users:1000:alice\n";
+    const AUTH_DATABASE: &[u8] = b"NORX-USERDB 1\n\
+u:alice:1000:1000:0:0:/users/alice:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY\n\
+u:disabled:1001:1000:1:0:/users/disabled:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY\n\
+u:locked:1002:1000:2:0:/users/locked:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY\n\
+u:expired:1003:1000:4:0:/users/expired:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY\n\
+u:provisioned:1004:1000:0:0:/users/provisioned:/bin/nsh:NO_PASSWORD\n";
 
     struct Verifier;
 
     impl PasswordVerifier for Verifier {
         fn verify(&self, password: &[u8], encoded_hash: &[u8]) -> bool {
+            (password == b"correct" && encoded_hash == HASH)
+                || (password == b"newpass!" && encoded_hash == NEW_HASH)
+        }
+    }
+
+    struct CountingVerifier {
+        calls: Cell<usize>,
+        dummy_calls: Cell<usize>,
+    }
+
+    impl PasswordVerifier for CountingVerifier {
+        fn verify(&self, password: &[u8], encoded_hash: &[u8]) -> bool {
+            self.calls.set(self.calls.get() + 1);
+            if encoded_hash == DUMMY_PASSWORD_HASH.as_bytes() {
+                self.dummy_calls.set(self.dummy_calls.get() + 1);
+            }
             password == b"correct" && encoded_hash == HASH
         }
     }
@@ -1269,14 +1384,24 @@ mod tests {
         fn hash(&self, password: &[u8]) -> Option<String> {
             (password == b"newpass!").then(|| {
                 String::from(
-                    "$argon2id$v=19$m=65536,t=3,p=1$bmV3c2FsdFNhbXBsZQ$bmV3ZGlnaWVzdFNhbXBsZQ",
+                    "$argon2id$v=19$m=65536,t=3,p=1$bmV3LXNhbHQtdmFsdWUhIQ$bmV3LWRpZ2VzdC12YWx1ZS0wMTIzNDU2Nzg5YWJjZGU",
                 )
             })
         }
     }
 
-    const NEW_HASH: &[u8] =
-        b"$argon2id$v=19$m=65536,t=3,p=1$bmV3c2FsdFNhbXBsZQ$bmV3ZGlnaWVzdFNhbXBsZQ";
+    struct CountingHasher {
+        calls: Cell<usize>,
+    }
+
+    impl PasswordHasher for CountingHasher {
+        fn hash(&self, _password: &[u8]) -> Option<String> {
+            self.calls.set(self.calls.get() + 1);
+            Some(String::from(
+                "$argon2id$v=19$m=65536,t=3,p=1$bmV3LXNhbHQtdmFsdWUhIQ$bmV3LWRpZ2VzdC12YWx1ZS0wMTIzNDU2Nzg5YWJjZGU",
+            ))
+        }
+    }
 
     #[test]
     fn parses_without_exposing_hash_and_authenticates() {
@@ -1302,6 +1427,30 @@ mod tests {
     }
 
     #[test]
+    fn authentication_verifies_all_account_states_and_missing_users() {
+        let database = Database::parse(AUTH_DATABASE).unwrap();
+        let verifier = CountingVerifier {
+            calls: Cell::new(0),
+            dummy_calls: Cell::new(0),
+        };
+        let names: [&[u8]; 5] = [
+            b"missing",
+            b"disabled",
+            b"locked",
+            b"expired",
+            b"provisioned",
+        ];
+        for name in names {
+            assert_eq!(
+                database.authenticate(name, b"correct", &verifier),
+                Err(AuthError::Denied)
+            );
+        }
+        assert_eq!(verifier.calls.get(), names.len());
+        assert_eq!(verifier.dummy_calls.get(), 2);
+    }
+
+    #[test]
     fn round_trip_is_deterministic() {
         let database = Database::parse(DATABASE).unwrap();
         assert_eq!(database.serialize_for_storage().unwrap(), DATABASE);
@@ -1309,12 +1458,50 @@ mod tests {
 
     #[test]
     fn rejects_duplicates_overflow_and_bad_hashes() {
-        let duplicate = b"NORX-USERDB 1\nu:alice:1000:1000:0:0:/users/a:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$c2FsdFNhbXBsZQ$ZGlnaWVzdFNhbXBsZQ\nu:bob:1000:1001:0:0:/users/b:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$c2FsdFNhbXBsZQ$ZGlnaWVzdFNhbXBsZQ\n";
+        let duplicate = b"NORX-USERDB 1\nu:alice:1000:1000:0:0:/users/a:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY\nu:bob:1000:1001:0:0:/users/b:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY\n";
         assert_eq!(Database::parse(duplicate), Err(ParseError::Duplicate));
         let bad_hash = b"NORX-USERDB 1\nu:alice:1000:1000:0:0:/users/a:/bin/nsh:$bcrypt$hash\n";
         assert_eq!(Database::parse(bad_hash), Err(ParseError::InvalidHash));
-        let overflow = b"NORX-USERDB 1\nu:alice:42949672960:1000:0:0:/users/a:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$c2FsdFNhbXBsZQ$ZGlnaWVzdFNhbXBsZQ\n";
+        let overflow = b"NORX-USERDB 1\nu:alice:42949672960:1000:0:0:/users/a:/bin/nsh:$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY\n";
         assert_eq!(Database::parse(overflow), Err(ParseError::InvalidNumber));
+    }
+
+    #[test]
+    fn rejects_noncanonical_paths_and_password_hash_fields() {
+        assert_eq!(parse_path(b"/users/./alice"), Err(ParseError::InvalidPath));
+        assert_eq!(parse_path(b"/users/../alice"), Err(ParseError::InvalidPath));
+        assert!(parse_path(b"/users/.config").is_ok());
+        assert!(validate_password_hash(HASH).is_ok());
+        assert!(validate_password_hash(DUMMY_PASSWORD_HASH.as_bytes()).is_ok());
+
+        let short_salt = b"$argon2id$v=19$m=65536,t=3,p=1$c2FsdFNhbXBsZQ$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
+        let short_digest =
+            b"$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$ZGlnaWVzdFNhbXBsZQ";
+        let padded = b"$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg=$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
+        let noncanonical_tail = b"$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZh$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
+        let wrong_parameters = b"$argon2id$v=19$m=65535,t=3,p=1$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
+        for hash in [
+            &short_salt[..],
+            &short_digest[..],
+            &padded[..],
+            &noncanonical_tail[..],
+            &wrong_parameters[..],
+        ] {
+            assert_eq!(validate_password_hash(hash), Err(ParseError::InvalidHash));
+        }
+    }
+
+    #[test]
+    fn malformed_database_byte_corpus_does_not_panic() {
+        for length in 0..=MAX_LINE_BYTES + 2 {
+            let mut bytes = Vec::with_capacity(FORMAT_HEADER.len() + 1 + length);
+            bytes.extend_from_slice(FORMAT_HEADER);
+            bytes.push(b'\n');
+            for index in 0..length {
+                bytes.push((index as u8).wrapping_mul(37).wrapping_add(11));
+            }
+            let _ = Database::parse(&bytes);
+        }
     }
 
     #[test]
@@ -1467,6 +1654,7 @@ mod tests {
         temporary: Option<Vec<u8>>,
         unavailable: bool,
         locked: bool,
+        fail_unlock: bool,
     }
 
     impl AtomicStorage for MemoryStorage {
@@ -1532,6 +1720,9 @@ mod tests {
         }
 
         fn unlock(&mut self) -> Result<(), StorageError> {
+            if self.fail_unlock {
+                return Err(StorageError::Unavailable);
+            }
             self.locked = false;
             Ok(())
         }
@@ -1580,6 +1771,46 @@ mod tests {
         storage.unlock().unwrap();
         atomic_replace(&mut storage, b"db", b"tmp", &database).unwrap();
         assert!(storage.committed.is_some());
+    }
+
+    #[test]
+    fn atomic_storage_distinguishes_committed_data_from_unlock_failure() {
+        let database = Database::parse(DATABASE).unwrap();
+        let mut storage = MemoryStorage {
+            fail_unlock: true,
+            ..MemoryStorage::default()
+        };
+        assert_eq!(
+            atomic_replace(&mut storage, b"db", b"tmp", &database),
+            Err(StorageError::CommittedButUnlockFailed)
+        );
+        assert_eq!(storage.committed.as_deref(), Some(DATABASE));
+        assert!(storage.locked);
+
+        storage.fail_unlock = false;
+        storage.unlock().unwrap();
+    }
+
+    #[test]
+    fn recovery_distinguishes_promoted_data_from_unlock_failure() {
+        let mut storage = MemoryStorage {
+            temporary: Some(DATABASE.to_vec()),
+            fail_unlock: true,
+            ..MemoryStorage::default()
+        };
+        assert_eq!(
+            load_with_recovery(&mut storage, b"db", b"tmp"),
+            Err(StorageError::CommittedButUnlockFailed)
+        );
+        assert_eq!(storage.committed.as_deref(), Some(DATABASE));
+        assert!(storage.temporary.is_none());
+
+        storage.fail_unlock = false;
+        assert_eq!(
+            load_with_recovery(&mut storage, b"db", b"tmp").unwrap().1,
+            RecoveryState::Current
+        );
+        storage.unlock().unwrap();
     }
 
     #[test]
@@ -1689,6 +1920,105 @@ mod tests {
         assert!(database.lookup_user(b"bobby").is_none());
     }
 
+    struct LegacySentinelVerifier;
+
+    impl PasswordVerifier for LegacySentinelVerifier {
+        fn verify(&self, password: &[u8], encoded_hash: &[u8]) -> bool {
+            password == b"sentinel" && encoded_hash == LEGACY_LOCKED_PASSWORD_HASH
+        }
+    }
+
+    #[test]
+    fn legacy_locked_sentinel_is_migrated_to_no_password() {
+        let bytes = b"NORX-USERDB 1\nu:legacy:1001:1000:2:0:/users/legacy:/bin/false:$argon2id$v=19$m=65536,t=3,p=1$bG9ja2VkLXNlbnRpbmVs$bm90LWEtcGFzc3dvcmQ=\n";
+        let mut database = Database::parse(bytes).unwrap();
+        let root = SessionCredentials {
+            capabilities: CAP_ACCOUNT_ADMIN,
+            ..SessionCredentials::from_user(&database.lookup_user(b"legacy").unwrap())
+        };
+        database.set_locked(root, 1001, false).unwrap();
+        assert_eq!(
+            database.authenticate(b"legacy", b"sentinel", &LegacySentinelVerifier),
+            Err(AuthError::Denied)
+        );
+        let serialized = database.serialize_for_storage().unwrap();
+        assert!(serialized
+            .windows(NO_PASSWORD.len())
+            .any(|window| window == NO_PASSWORD.as_bytes()));
+    }
+
+    #[test]
+    fn user_creation_rejects_invalid_passwords_before_hashing() {
+        let root = SessionCredentials {
+            real_uid: 0,
+            effective_uid: 0,
+            saved_uid: 0,
+            real_gid: 0,
+            effective_gid: 0,
+            saved_gid: 0,
+            capabilities: CAP_ACCOUNT_ADMIN,
+        };
+        let invalid_passwords = vec![
+            Vec::new(),
+            b"short".to_vec(),
+            vec![b'a'; MAX_PASSWORD_BYTES + 1],
+            b"valid\0password".to_vec(),
+            b"valid\rpassword".to_vec(),
+            b"valid\npassword".to_vec(),
+        ];
+
+        for password in invalid_passwords {
+            let mut database = Database::parse(DATABASE).unwrap();
+            let hasher = CountingHasher {
+                calls: Cell::new(0),
+            };
+            assert_eq!(
+                database.create_user(
+                    root,
+                    UserSpec {
+                        name: String::from("bob"),
+                        uid: None,
+                        primary_gid: Some(1000),
+                        supplementary_groups: Vec::new(),
+                        home: Some(String::from("/users/bob")),
+                        shell: Some(String::from("/bin/nsh")),
+                        flags: 0,
+                        capabilities: 0,
+                    },
+                    &password,
+                    &hasher,
+                ),
+                Err(AdminError::InvalidInput)
+            );
+            assert_eq!(hasher.calls.get(), 0);
+            assert!(database.lookup_user(b"bob").is_none());
+        }
+
+        let mut database = Database::parse(DATABASE).unwrap();
+        let hasher = CountingHasher {
+            calls: Cell::new(0),
+        };
+        assert_eq!(
+            database.create_user(
+                root,
+                UserSpec {
+                    name: String::from("bob"),
+                    uid: None,
+                    primary_gid: Some(1000),
+                    supplementary_groups: Vec::new(),
+                    home: Some(String::from("/users/bob")),
+                    shell: Some(String::from("/bin/nsh")),
+                    flags: 0,
+                    capabilities: 0,
+                },
+                b"validpass",
+                &hasher,
+            ),
+            Ok(1001)
+        );
+        assert_eq!(hasher.calls.get(), 1);
+    }
+
     #[test]
     fn locked_creation_has_no_usable_password_and_validates_groups() {
         let mut database = Database::parse(DATABASE).unwrap();
@@ -1714,6 +2044,40 @@ mod tests {
         let user = database.lookup_user(b"service").unwrap();
         assert_eq!(user.uid, uid);
         assert!(user.flags & FLAG_LOCKED != 0);
+        assert_eq!(
+            database.authenticate(b"service", b"anything", &Verifier),
+            Err(AuthError::Denied)
+        );
+        let serialized = database.serialize_for_storage().unwrap();
+        assert!(serialized
+            .windows(NO_PASSWORD.len())
+            .any(|window| window == NO_PASSWORD.as_bytes()));
+        let reloaded = Database::parse(&serialized).unwrap();
+        assert_eq!(
+            reloaded.authenticate(b"service", b"anything", &Verifier),
+            Err(AuthError::Denied)
+        );
+        database.set_locked(root, uid, false).unwrap();
+        assert_eq!(database.lookup_user(b"service").unwrap().flags, 0);
+        assert_eq!(
+            database.authenticate(b"service", b"anything", &Verifier),
+            Err(AuthError::Denied)
+        );
+        database
+            .change_password(
+                root,
+                uid,
+                None,
+                b"newpass!",
+                b"newpass!",
+                PasswordPolicy::DEFAULT,
+                &Verifier,
+                &Hasher,
+            )
+            .unwrap();
+        assert!(database
+            .authenticate(b"service", b"newpass!", &Verifier)
+            .is_ok());
         assert_eq!(
             database.authenticate(b"service", b"anything", &Verifier),
             Err(AuthError::Denied)
@@ -1762,6 +2126,40 @@ mod tests {
             Err(AdminError::Storage(StorageError::Unavailable))
         );
         assert_eq!(database, before);
+    }
+
+    #[test]
+    fn admin_transaction_reconciles_memory_after_unlock_failure() {
+        let mut database = Database::parse(DATABASE).unwrap();
+        let root = SessionCredentials {
+            capabilities: CAP_ACCOUNT_ADMIN,
+            ..SessionCredentials::from_user(&database.lookup_user(b"alice").unwrap())
+        };
+        let mut storage = MemoryStorage {
+            committed: Some(DATABASE.to_vec()),
+            fail_unlock: true,
+            ..MemoryStorage::default()
+        };
+        assert_eq!(
+            database.transact_admin(root, &mut storage, b"db", b"tmp", |candidate| {
+                candidate.modify_user(
+                    root,
+                    1000,
+                    UserUpdate {
+                        shell: Some(String::from("/bin/true")),
+                        ..UserUpdate::default()
+                    },
+                )
+            }),
+            Err(AdminError::Storage(StorageError::CommittedButUnlockFailed))
+        );
+        assert_eq!(database.lookup_user(b"alice").unwrap().shell, "/bin/true");
+        let (reloaded, state) = load_with_recovery(&mut storage, b"db", b"tmp").unwrap();
+        assert_eq!(state, RecoveryState::Current);
+        assert_eq!(reloaded, database);
+
+        storage.fail_unlock = false;
+        storage.unlock().unwrap();
     }
 
     #[test]
